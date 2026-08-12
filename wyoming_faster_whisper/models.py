@@ -95,12 +95,17 @@ class ModelLoader:
         )
         has_onnx_asr = _module_available("onnx_asr")
         has_funasr = _module_available("funasr")
+        has_qwen3_asr = _module_available("onnxruntime") and _module_available(
+            "tokenizers"
+        )
         _LOGGER.debug(
-            "Backends available: sherpa=%s transformers=%s onnx_asr=%s funasr=%s",
+            "Backends available: sherpa=%s transformers=%s onnx_asr=%s funasr=%s"
+            " qwen3_asr=%s",
             has_sherpa,
             has_transformers,
             has_onnx_asr,
             has_funasr,
+            has_qwen3_asr,
         )
 
         # Select speech-to-text library
@@ -112,6 +117,7 @@ class ModelLoader:
             has_sherpa=has_sherpa,
             has_onnx_asr=has_onnx_asr,
             has_funasr=has_funasr,
+            has_qwen3_asr=has_qwen3_asr,
         )
 
         # Streaming is only supported by the sherpa backend.
@@ -174,6 +180,15 @@ class ModelLoader:
                     cache_dir=self.download_dir,
                     local_files_only=self.local_files_only,
                 )
+            elif stt_library == SttLibrary.QWEN3_ASR:
+                from .qwen3_asr_handler import Qwen3AsrTranscriber  # noqa: F811
+
+                transcriber = Qwen3AsrTranscriber(
+                    model,
+                    cache_dir=self.download_dir,
+                    local_files_only=self.local_files_only,
+                    cpu_threads=self.cpu_threads,
+                )
             elif stt_library == SttLibrary.FUNASR:
                 from .funasr_handler import FunASRTranscriber  # noqa: F811
 
@@ -227,6 +242,7 @@ def guess_stt_library(
     has_sherpa: bool,
     has_onnx_asr: bool,
     has_funasr: bool,
+    has_qwen3_asr: bool = False,
 ) -> SttLibrary:
     """Resolve which speech-to-text library to use.
 
@@ -262,6 +278,7 @@ def guess_stt_library(
         SttLibrary.SHERPA: has_sherpa,
         SttLibrary.ONNX_ASR: has_onnx_asr,
         SttLibrary.FUNASR: has_funasr,
+        SttLibrary.QWEN3_ASR: has_qwen3_asr,
     }
     if not available.get(preferred_stt_library, True):
         _LOGGER.debug("Falling back to faster-whisper (missing dependencies)")
@@ -317,6 +334,9 @@ def guess_model(
 
     if stt_library == SttLibrary.ONNX_ASR:
         return "gigaam-v2-rnnt"
+
+    if stt_library == SttLibrary.QWEN3_ASR:
+        return "rhasspy/qwen3-asr-0.6b-onnx-int4"
 
     if stt_library == SttLibrary.FUNASR:
         return "FunAudioLLM/SenseVoiceSmall"

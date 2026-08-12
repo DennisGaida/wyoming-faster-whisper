@@ -14,6 +14,7 @@ _ALL_AVAILABLE = dict(
     has_sherpa=True,
     has_onnx_asr=True,
     has_funasr=True,
+    has_qwen3_asr=True,
 )
 
 
@@ -76,6 +77,24 @@ def test_explicit_funasr_falls_back_when_missing() -> None:
         _guess(SttLibrary.FUNASR, "zh", has_funasr=False)
         == SttLibrary.FASTER_WHISPER
     )
+
+
+def test_explicit_qwen3_asr_kept_when_available() -> None:
+    assert _guess(SttLibrary.QWEN3_ASR, "en") == SttLibrary.QWEN3_ASR
+
+
+def test_explicit_qwen3_asr_falls_back_when_missing() -> None:
+    assert (
+        _guess(SttLibrary.QWEN3_ASR, "en", has_qwen3_asr=False)
+        == SttLibrary.FASTER_WHISPER
+    )
+
+
+def test_auto_never_selects_qwen3_asr() -> None:
+    # Qwen3-ASR is opt-in only: it is large and slow relative to the
+    # per-language defaults, so AUTO must not route to it.
+    for language in ("en", "ru", "zh", "de", None):
+        assert _guess(SttLibrary.AUTO, language) != SttLibrary.QWEN3_ASR
 
 
 def test_explicit_faster_whisper_is_passthrough() -> None:

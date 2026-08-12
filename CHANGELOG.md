@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add support for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) via `--stt-library qwen3-asr` (extra: `qwen3_asr`), defaulting to [`rhasspy/qwen3-asr-0.6b-onnx-int4`](https://huggingface.co/rhasspy/qwen3-asr-0.6b-onnx-int4)
+- `--initial-prompt` now also biases the Qwen3-ASR backend: it is passed as the model's context prompt, which corrects entity names (e.g. `Vocabulary: Ecobee.` turns "incubator" into "Ecobee")
+- Qwen3-ASR is opt-in only (`auto` never selects it): the model is 1.4 GB and needs ~1.7 GB of RAM, and it is slower than the per-language defaults
+
 ## 3.5.0
 
 - Bump torch to avoid regression: https://github.com/pytorch/pytorch/issues/146792
