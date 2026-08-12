@@ -81,6 +81,10 @@ onnx_asr = [
 funasr = [
     "funasr>=1.1.0,<2",
 ]
+qwen3_asr = [
+    "onnxruntime>=1.18.1",
+    "tokenizers>=0.20",
+]
 zeroconf = [
     "wyoming[zeroconf]",
 ]

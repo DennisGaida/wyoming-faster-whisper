@@ -69,11 +69,12 @@ async def main() -> None:
         "--cpu-threads",
         default=4,
         type=int,
-        help="Number of CPU threads to use for inference (default: 4, faster-whisper and sherpa-onnx)",
+        help="Number of CPU threads to use for inference (default: 4, faster-whisper, sherpa-onnx, and qwen3-asr)",
     )
     parser.add_argument(
         "--initial-prompt",
-        help="Optional text to provide as a prompt for the first window (faster-whisper only)",
+        help="Optional text to provide as a prompt for the first window "
+        "(faster-whisper); used as biasing context for entity names (qwen3-asr)",
     )
     parser.add_argument(
         "--whisper-task",

@@ -15,6 +15,7 @@ class SttLibrary(str, Enum):
     SHERPA = "sherpa"
     ONNX_ASR = "onnx-asr"
     FUNASR = "funasr"
+    QWEN3_ASR = "qwen3-asr"
 
 
 AUTO_LANGUAGE = "auto"
