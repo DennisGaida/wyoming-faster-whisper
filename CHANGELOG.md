@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `--hass-token` (extra: `hass`) to bias transcription toward the names in Home Assistant: conversation-exposed entity names and aliases, plus area and floor names, read over the websocket API and passed to the model as a prompt (fixes e.g. "What's the temperature of the incubi?" → "What's the temperature of the Ecobee?")
+- Names are refreshed in the background starting at `AudioStart`, so the fetch finishes while the speaker is still talking and adds no latency; a slow or unreachable Home Assistant falls back to the previous names and never fails a transcript
+- Names are added to the prompt in priority order (areas, floors, entity names, aliases) up to `--hass-prompt-max-tokens` (default 200, Whisper's hard cap is 223); `--initial-prompt` is kept at the front
+- Add `--hass-api`, `--hass-refresh-seconds`, `--hass-prompt-max-tokens`, and `--hass-prompt-timeout`
+
 - Add support for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) via `--stt-library qwen3-asr` (extra: `qwen3_asr`), defaulting to [`rhasspy/qwen3-asr-0.6b-onnx-int4`](https://huggingface.co/rhasspy/qwen3-asr-0.6b-onnx-int4)
 - `--initial-prompt` now also biases the Qwen3-ASR backend: it is passed as the model's context prompt, which corrects entity names (e.g. `Vocabulary: Ecobee.` turns "incubator" into "Ecobee")
 - Qwen3-ASR is opt-in only (`auto` never selects it): the model is 1.4 GB and needs ~1.7 GB of RAM, and it is slower than the per-language defaults

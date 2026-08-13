@@ -36,6 +36,13 @@ class FasterWhisperTranscriber(Transcriber):
             cpu_threads=cpu_threads,
         )
 
+    def count_prompt_tokens(self, text: str) -> Optional[int]:
+        tokenizer = getattr(self.model, "hf_tokenizer", None)
+        if tokenizer is None:
+            return None
+
+        return len(tokenizer.encode(text, add_special_tokens=False).ids)
+
     def transcribe(
         self,
         wav_path: Union[str, Path],

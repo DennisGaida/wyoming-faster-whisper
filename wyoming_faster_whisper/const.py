@@ -21,6 +21,9 @@ class SttLibrary(str, Enum):
 AUTO_LANGUAGE = "auto"
 AUTO_MODEL = "auto"
 
+# Where to look for Home Assistant when biasing toward its names.
+HASS_API_URL = "http://homeassistant.local:8123/api"
+
 # SenseVoice (FunASR) can be told to decode these languages explicitly;
 # otherwise it auto-detects. Maps the locale-style codes that Home Assistant /
 # intent-sentences use (e.g. "zh-CN") onto the base SenseVoice language.
@@ -85,6 +88,15 @@ class Transcriber(ABC):
         initial_prompt: Optional[str] = None,
     ) -> str:
         pass
+
+    def count_prompt_tokens(self, text: str) -> Optional[int]:
+        """Count the tokens ``text`` would use as an initial_prompt.
+
+        Returns None when this backend has no tokenizer to ask, in which case
+        callers fall back to an estimate. Used to fit as many entity names as
+        possible into the prompt without crossing the model's context limit.
+        """
+        return None
 
     @property
     def supports_streaming(self) -> bool:

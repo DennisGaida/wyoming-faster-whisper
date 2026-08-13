@@ -1,0 +1,239 @@
+"""Tests for reading names out of Home Assistant.
+
+Runs against a real websocket server on localhost that speaks Home Assistant's
+protocol, so the auth handshake, the command/reply pairing, and the shape of the
+registry responses are all exercised for real -- only the data is fake.
+"""
+
+import json
+
+import pytest
+
+pytest.importorskip("aiohttp")
+
+# pylint: disable=wrong-import-position
+from aiohttp import web  # noqa: E402
+from aiohttp.test_utils import TestServer  # noqa: E402
+
+from wyoming_faster_whisper.hass_api import (  # noqa: E402
+    HomeAssistant,
+    HomeAssistantError,
+)
+
+TOKEN = "good-token"
+
+_EXPOSED = {
+    "exposed_entities": {
+        "light.office_lamp": {"conversation": True},
+        "sensor.ecobee": {"conversation": True},
+        "switch.old": {"conversation": True},
+        # Not exposed to conversation: not a possible voice target.
+        "light.secret": {"conversation": False},
+    }
+}
+
+_STATES = [
+    {"entity_id": "light.office_lamp", "attributes": {"friendly_name": "Office Lamp"}},
+    {"entity_id": "sensor.ecobee", "attributes": {"friendly_name": "Ecobee"}},
+    {"entity_id": "switch.old", "attributes": {"friendly_name": "Old Switch"}},
+    {"entity_id": "light.secret", "attributes": {"friendly_name": "Secret Light"}},
+]
+
+_ENTRIES = {
+    "light.office_lamp": {"aliases": ["Desk Lamp"], "disabled_by": None},
+    "sensor.ecobee": {"aliases": [], "disabled_by": None},
+    # Disabled entities are gone from the user's home in every practical sense.
+    "switch.old": {"aliases": ["Ancient Switch"], "disabled_by": "user"},
+}
+
+_AREAS = [
+    {"area_id": "office", "name": "Office", "aliases": ["Study"]},
+    {"area_id": "kitchen", "name": "Kitchen", "aliases": []},
+]
+
+_FLOORS = [{"floor_id": "upstairs", "name": "Upstairs", "aliases": ["Top Floor"]}]
+
+_RESULTS = {
+    "homeassistant/expose_entity/list": _EXPOSED,
+    "get_states": _STATES,
+    "config/entity_registry/get_entries": _ENTRIES,
+    "config/area_registry/list": _AREAS,
+    "config/floor_registry/list": _FLOORS,
+}
+
+
+def _app(results=None, fail_command=None) -> web.Application:
+    """A fake Home Assistant websocket API."""
+    results = _RESULTS if results is None else results
+
+    async def handler(request: web.Request) -> web.WebSocketResponse:
+        websocket = web.WebSocketResponse()
+        await websocket.prepare(request)
+
+        await websocket.send_json({"type": "auth_required", "ha_version": "2026.8.0"})
+        msg = json.loads((await websocket.receive()).data)
+        if (msg.get("type") != "auth") or (msg.get("access_token") != TOKEN):
+            await websocket.send_json({"type": "auth_invalid"})
+            return websocket
+
+        await websocket.send_json({"type": "auth_ok"})
+
+        async for raw in websocket:
+            msg = json.loads(raw.data)
+            msg_type = msg["type"]
+            if msg_type == fail_command:
+                await websocket.send_json(
+                    {
+                        "id": msg["id"],
+                        "type": "result",
+                        "success": False,
+                        "error": {"code": "unauthorized", "message": "nope"},
+                    }
+                )
+                continue
+
+            await websocket.send_json(
+                {
+                    "id": msg["id"],
+                    "type": "result",
+                    "success": True,
+                    "result": results[msg_type],
+                }
+            )
+
+        return websocket
+
+    app = web.Application()
+    app.router.add_get("/api/websocket", handler)
+    return app
+
+
+async def _client(app: web.Application, token: str = TOKEN):
+    """Start the fake server and return a client pointed at it, plus the server."""
+    server = TestServer(app)
+    await server.start_server()
+    hass = HomeAssistant(token, api_url=f"http://127.0.0.1:{server.port}/api")
+    return hass, server
+
+
+# --- happy path -----------------------------------------------------------
+
+
+async def test_reads_areas_floors_entities_and_aliases():
+    hass, server = await _client(_app())
+    try:
+        context = await hass.get_context()
+    finally:
+        await server.close()
+
+    assert context.areas == ["Office", "Study", "Kitchen"]
+    assert context.floors == ["Upstairs", "Top Floor"]
+    assert context.entities == ["Office Lamp", "Ecobee"]
+    assert context.aliases == ["Desk Lamp"]
+
+
+async def test_unexposed_entities_are_ignored():
+    hass, server = await _client(_app())
+    try:
+        context = await hass.get_context()
+    finally:
+        await server.close()
+
+    assert "Secret Light" not in context.all_names()
+
+
+async def test_disabled_entities_and_their_aliases_are_ignored():
+    hass, server = await _client(_app())
+    try:
+        context = await hass.get_context()
+    finally:
+        await server.close()
+
+    names = context.all_names()
+    assert "Old Switch" not in names
+    assert "Ancient Switch" not in names
+
+
+async def test_the_prompt_is_built_from_a_live_fetch():
+    hass, server = await _client(_app())
+    try:
+        context = await hass.get_context()
+    finally:
+        await server.close()
+
+    prompt = context.whisper_prompt(lambda text: len(text.split()), max_tokens=1000)
+    assert (
+        prompt
+        == "Office, Study, Kitchen, Upstairs, Top Floor, Office Lamp, Ecobee, Desk Lamp."
+    )
+
+
+async def test_an_empty_home_yields_no_names():
+    empty = {
+        "homeassistant/expose_entity/list": {"exposed_entities": {}},
+        "get_states": [],
+        "config/area_registry/list": [],
+        "config/floor_registry/list": [],
+    }
+    hass, server = await _client(_app(results=empty))
+    try:
+        context = await hass.get_context()
+    finally:
+        await server.close()
+
+    assert not context
+
+
+# --- failures -------------------------------------------------------------
+
+
+async def test_a_bad_token_raises():
+    hass, server = await _client(_app(), token="wrong-token")
+    try:
+        with pytest.raises(HomeAssistantError):
+            await hass.get_context()
+    finally:
+        await server.close()
+
+
+async def test_a_refused_command_raises():
+    hass, server = await _client(_app(fail_command="get_states"))
+    try:
+        with pytest.raises(HomeAssistantError):
+            await hass.get_context()
+    finally:
+        await server.close()
+
+
+async def test_an_unreachable_home_assistant_raises():
+    # Nothing is listening on this port.
+    hass = HomeAssistant(TOKEN, api_url="http://127.0.0.1:1/api", timeout=2.0)
+    with pytest.raises(HomeAssistantError):
+        await hass.get_context()
+
+
+# --- url handling ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("api_url", "expected"),
+    [
+        (
+            "http://homeassistant.local:8123/api",
+            "ws://homeassistant.local:8123/api/websocket",
+        ),
+        ("https://ha.example.com/api", "wss://ha.example.com/api/websocket"),
+        # A trailing slash must not double up.
+        (
+            "http://homeassistant.local:8123/api/",
+            "ws://homeassistant.local:8123/api/websocket",
+        ),
+    ],
+)
+def test_websocket_url_is_derived_from_the_api_url(api_url, expected):
+    assert HomeAssistant(TOKEN, api_url=api_url).websocket_api_url == expected
+
+
+def test_a_non_http_url_is_rejected():
+    with pytest.raises(ValueError):
+        HomeAssistant(TOKEN, api_url="ftp://homeassistant.local/api")
