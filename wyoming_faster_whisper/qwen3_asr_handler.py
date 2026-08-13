@@ -2,14 +2,28 @@
 
 Qwen3-ASR is a speech LLM: an audio encoder feeds projected audio embeddings into
 a Qwen3 decoder that generates the transcript token by token. The ONNX export
-splits it into three graphs (encoder, decoder prefill, decoder step), so unlike
-the other backends there is no library that drives it for us - the greedy decode
-loop lives here.
+splits it into several graphs, so unlike the other backends there is no library
+that drives it for us - the greedy decode loop lives here.
 
 The payoff is context biasing. Qwen3-ASR accepts free-form text in the chat
 template's system turn to bias decoding toward specific spellings, so
 ``--initial-prompt`` can carry Home Assistant entity names ("Vocabulary: Ecobee,
 office lamp.") and fix names that would otherwise be transcribed phonetically.
+
+Two decoder layouts are supported, chosen by which files the model directory has:
+
+*merged* (``decoder_merged.int4.onnx``) - one graph taking a KV cache *and* a
+dynamic sequence length. Because the biasing prompt sits in the system turn,
+ahead of the audio, its KV depends only on the prompt tokens, so it is computed
+once and reused for every later utterance. That matters because the prompt is not
+free: a 50-name list is ~180 tokens of prefill, which on a Pi 5 took a 3.2 s
+command from 1.47 s to 3.42 s. Reusing it gives 2.20 s, and the graph also drops
+the in-graph embedding table (1407 -> 785 MB on disk, 2.25 -> 1.55 GB peak RSS).
+
+*split* (``decoder_init`` + ``decoder_step``) - the original export. ``decoder_init``
+has no KV input and ``decoder_step`` is pinned to one token, so the prompt must be
+re-prefilled every utterance. Kept as a fallback so existing model directories
+keep working.
 
 onnxruntime is imported at module scope (not lazily inside __init__) so that
 importing this module raises ImportError when it is absent. ModelLoader relies on
@@ -19,6 +33,7 @@ onnx_asr_handler/funasr_handler.
 
 import json
 import logging
+import threading
 import wave
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -66,10 +81,21 @@ _ALLOW_PATTERNS = [
     "embed_tokens.bin",
     "encoder.int4.onnx",
     "encoder.int4.onnx.data",
+    # Merged layout.
+    "decoder_merged.int4.onnx",
+    "decoder_merged.int4.onnx.data",
+    # Split layout. A repo has one layout or the other, and patterns that match
+    # nothing are simply skipped, so one list serves both.
     "decoder_init.int4.onnx",
     "decoder_step.int4.onnx",
     "decoder_weights.int4.data",
 ]
+
+# Presence of this file selects the merged layout.
+_MERGED_DECODER = "decoder_merged.int4.onnx"
+
+# Additive attention mask: 0 where attending is allowed, this where it is not.
+_MASK_BLOCKED = np.finfo(np.float32).min
 
 # Language names the model was trained to accept in the forced-language suffix.
 _LANGUAGE_NAMES = {
@@ -176,6 +202,31 @@ def _log_mel_spectrogram(audio: np.ndarray, mel_filters: np.ndarray) -> np.ndarr
     return log_spec[np.newaxis, :, :].astype(np.float32)
 
 
+def _system_ids(context_ids: Sequence[int]) -> List[int]:
+    """The chat template's system turn, which is where the biasing context goes.
+
+    Split out because it is exactly the span whose KV the merged decoder caches:
+    it precedes the audio, so nothing in it changes from one utterance to the next.
+    """
+    return [_IM_START, _SYSTEM, _NEWLINE, *context_ids, _IM_END, _NEWLINE]
+
+
+def _causal_mask(q_len: int, past_len: int) -> np.ndarray:
+    """[1, 1, q_len, past_len + q_len] additive mask for the merged decoder.
+
+    New tokens may attend to everything already in the cache, and causally among
+    themselves. Built here rather than inside the graph because deriving it from
+    input shapes is the kind of shape arithmetic the ONNX exporter freezes into
+    constants.
+    """
+    new = np.triu(np.full((q_len, q_len), _MASK_BLOCKED, dtype=np.float32), k=1)
+    if past_len == 0:
+        return new[np.newaxis, np.newaxis]
+
+    past = np.zeros((q_len, past_len), dtype=np.float32)
+    return np.concatenate([past, new], axis=-1)[np.newaxis, np.newaxis]
+
+
 class Qwen3AsrTranscriber(Transcriber):
     """Wrapper for a Qwen3-ASR ONNX export (encoder + split decoder)."""
 
@@ -209,12 +260,43 @@ class Qwen3AsrTranscriber(Transcriber):
         self._encoder = ort.InferenceSession(
             str(model_dir / "encoder.int4.onnx"), **session_args
         )
-        self._decoder_init = ort.InferenceSession(
-            str(model_dir / "decoder_init.int4.onnx"), **session_args
-        )
-        self._decoder_step = ort.InferenceSession(
-            str(model_dir / "decoder_step.int4.onnx"), **session_args
-        )
+
+        self._merged: Optional[ort.InferenceSession] = None
+        self._decoder_init: Optional[ort.InferenceSession] = None
+        self._decoder_step: Optional[ort.InferenceSession] = None
+
+        if (model_dir / _MERGED_DECODER).is_file():
+            self._merged = ort.InferenceSession(
+                str(model_dir / _MERGED_DECODER), **session_args
+            )
+            # present_keys is [num_layers, batch, kv_heads, seq, head_dim]; the
+            # non-sequence dims are static, so the empty cache that starts a
+            # prefill can be shaped from the graph instead of from config.json.
+            kv_shape = self._merged.get_outputs()[1].shape
+            self._empty_kv = np.zeros(
+                (kv_shape[0], 1, kv_shape[2], 0, kv_shape[4]), dtype=np.float32
+            )
+            _LOGGER.debug("Using merged decoder (biasing prompt KV is reused)")
+        else:
+            self._decoder_init = ort.InferenceSession(
+                str(model_dir / "decoder_init.int4.onnx"), **session_args
+            )
+            self._decoder_step = ort.InferenceSession(
+                str(model_dir / "decoder_step.int4.onnx"), **session_args
+            )
+            _LOGGER.debug(
+                "Using split decoder; the biasing prompt is re-prefilled every "
+                "utterance. A model directory with %s avoids that.",
+                _MERGED_DECODER,
+            )
+
+        # Cached KV for the system turn, merged layout only. Exactly one entry:
+        # Home Assistant sends the same name list every time, and each entry is
+        # substantial (~42 MB for a 180-token prompt), so keeping a history would
+        # cost far more memory than it could ever save.
+        self._prefix_lock = threading.Lock()
+        self._prefix_key: Optional[Tuple[int, ...]] = None
+        self._prefix_kv: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
         with open(model_dir / "config.json", "r", encoding="utf-8") as config_file:
             config = json.load(config_file)
@@ -230,6 +312,9 @@ class Qwen3AsrTranscriber(Transcriber):
         self._mel_filters = _mel_filterbank()
         self._encoder_inputs = [inp.name for inp in self._encoder.get_inputs()]
         self._prompt_cache: Dict[Tuple[str, Optional[str]], List[int]] = {}
+
+    def count_prompt_tokens(self, text: str) -> Optional[int]:
+        return len(self._tokenizer.encode(text, add_special_tokens=False).ids)
 
     def _context_ids(
         self, initial_prompt: Optional[str], language: Optional[str]
@@ -272,15 +357,105 @@ class Qwen3AsrTranscriber(Transcriber):
         <|im_start|>assistant\n{language {Name}<asr_text>}
         """
         return (
-            [_IM_START, _SYSTEM, _NEWLINE, *context_ids, _IM_END, _NEWLINE]
+            _system_ids(context_ids)
             + [_IM_START, _USER, _NEWLINE, _AUDIO_START]
             + [_AUDIO_PAD] * n_audio_tokens
             + [_AUDIO_END, _IM_END, _NEWLINE]
             + [_IM_START, _ASSISTANT, _NEWLINE, *language_ids]
         )
 
+    def _run_merged(
+        self,
+        input_embeds: np.ndarray,
+        positions: Union[Sequence[int], np.ndarray],
+        past_keys: np.ndarray,
+        past_values: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One pass of the merged decoder over ``input_embeds``."""
+        assert self._merged is not None
+        return self._merged.run(
+            ["logits", "present_keys", "present_values"],
+            {
+                "input_embeds": input_embeds,
+                "position_ids": np.asarray(positions, dtype=np.int64)[np.newaxis, :],
+                "attention_mask": _causal_mask(
+                    input_embeds.shape[1], past_keys.shape[3]
+                ),
+                "past_keys": past_keys,
+                "past_values": past_values,
+            },
+        )
+
+    def _prefix_cache(self, system_ids: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+        """KV for the system turn, computed once and reused while it is unchanged."""
+        key = tuple(system_ids)
+        with self._prefix_lock:
+            if (self._prefix_key == key) and (self._prefix_kv is not None):
+                return self._prefix_kv
+
+        # Run outside the lock: this is a model pass, and holding the lock would
+        # serialize concurrent requests behind it. Two callers racing here just
+        # compute the same thing twice and store the same result.
+        _, keys, values = self._run_merged(
+            self._embed_tokens[system_ids].astype(np.float32)[np.newaxis, :, :],
+            np.arange(len(system_ids)),
+            self._empty_kv,
+            self._empty_kv,
+        )
+
+        with self._prefix_lock:
+            self._prefix_key = key
+            self._prefix_kv = (keys, values)
+
+        _LOGGER.debug("Cached KV for a %s-token system turn", len(system_ids))
+        return keys, values
+
+    def _generate_merged(
+        self,
+        audio_features: np.ndarray,
+        prompt_ids: List[int],
+        n_system: int,
+    ) -> List[int]:
+        """Greedy decode reusing the system turn's KV across utterances."""
+        past_keys, past_values = self._prefix_cache(prompt_ids[:n_system])
+
+        # Everything after the system turn: the audio placeholders and the
+        # assistant preamble. Audio features replace the placeholder embeddings.
+        rest = prompt_ids[n_system:]
+        input_embeds = self._embed_tokens[rest].astype(np.float32)[np.newaxis, :, :]
+        audio_at = prompt_ids.index(_AUDIO_PAD) - n_system
+        input_embeds[0, audio_at : audio_at + audio_features.shape[1]] = audio_features[
+            0
+        ]
+
+        logits, past_keys, past_values = self._run_merged(
+            input_embeds,
+            np.arange(n_system, len(prompt_ids)),
+            past_keys,
+            past_values,
+        )
+
+        token = int(np.argmax(logits[0, -1, :]))
+        tokens = [token]
+        position = len(prompt_ids)
+
+        while (token not in _EOS_IDS) and (len(tokens) < _MAX_NEW_TOKENS):
+            logits, past_keys, past_values = self._run_merged(
+                self._embed_tokens[token].astype(np.float32)[np.newaxis, np.newaxis, :],
+                [position],
+                past_keys,
+                past_values,
+            )
+            token = int(np.argmax(logits[0, -1, :]))
+            tokens.append(token)
+            position += 1
+
+        return tokens
+
     def _generate(self, audio_features: np.ndarray, prompt_ids: List[int]) -> List[int]:
-        """Greedy decode: prefill the prompt, then step one token at a time."""
+        """Greedy decode on the split layout: prefill, then one token at a time."""
+        assert (self._decoder_init is not None) and (self._decoder_step is not None)
+
         logits, past_keys, past_values = self._decoder_init.run(
             ["logits", "present_keys", "present_values"],
             {
@@ -351,7 +526,13 @@ class Qwen3AsrTranscriber(Transcriber):
         prompt_ids = self._build_prompt_ids(
             audio_features.shape[1], context_ids, language_ids
         )
-        tokens = self._generate(audio_features, prompt_ids)
+
+        if self._merged is not None:
+            tokens = self._generate_merged(
+                audio_features, prompt_ids, len(_system_ids(context_ids))
+            )
+        else:
+            tokens = self._generate(audio_features, prompt_ids)
 
         # The model writes the detected language before <asr_text>; drop it.
         if _ASR_TEXT in tokens:

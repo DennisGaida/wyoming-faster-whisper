@@ -7,6 +7,10 @@
 - Names are added to the prompt in priority order (areas, floors, entity names, aliases) up to `--hass-prompt-max-tokens` (default 200, Whisper's hard cap is 223); `--initial-prompt` is kept at the front
 - Add `--hass-api`, `--hass-refresh-seconds`, `--hass-prompt-max-tokens`, and `--hass-prompt-timeout`
 
+- Qwen3-ASR: support a merged decoder export (`decoder_merged.int4.onnx`) that takes a KV cache and a dynamic sequence length, so the biasing prompt's KV is computed once and reused instead of being re-prefilled every utterance. On a Pi 5 with a 50-name prompt, a 3.2s command goes from 3.42s to 2.20s (1.56x), peak RSS from 2.25 GB to 1.55 GB, and the package from 1407 MB to 785 MB
+- The merged layout is selected automatically when `decoder_merged.int4.onnx` is present; model directories with `decoder_init`/`decoder_step` keep working unchanged
+- The speedup applies to short commands. Long-form audio sees ~1.04x, since the cached prompt is a small share of the work — but the memory saving grows with length (4.16 GB → 2.87 GB on a 30s clip)
+
 - Add support for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) via `--stt-library qwen3-asr` (extra: `qwen3_asr`), defaulting to [`rhasspy/qwen3-asr-0.6b-onnx-int4`](https://huggingface.co/rhasspy/qwen3-asr-0.6b-onnx-int4)
 - `--initial-prompt` now also biases the Qwen3-ASR backend: it is passed as the model's context prompt, which corrects entity names (e.g. `Vocabulary: Ecobee.` turns "incubator" into "Ecobee")
 - Qwen3-ASR is opt-in only (`auto` never selects it): the model is 1.4 GB and needs ~1.7 GB of RAM, and it is slower than the per-language defaults
