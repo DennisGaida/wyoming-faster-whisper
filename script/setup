@@ -15,6 +15,15 @@ parser.add_argument(
 )
 parser.add_argument("--sherpa", action="store_true", help="Install sherpa requirements")
 parser.add_argument("--funasr", action="store_true", help="Install funasr requirements")
+parser.add_argument(
+    "--onnx-asr", action="store_true", help="Install onnx-asr requirements"
+)
+parser.add_argument(
+    "--qwen3-asr", action="store_true", help="Install qwen3-asr requirements"
+)
+parser.add_argument(
+    "--hass", action="store_true", help="Install Home Assistant requirements"
+)
 args = parser.parse_args()
 
 # Create virtual environment
@@ -39,6 +48,15 @@ if args.sherpa:
 
 if args.funasr:
     extras.append("funasr")
+
+if args.onnx_asr:
+    extras.append("onnx_asr")
+
+if args.qwen3_asr:
+    extras.append("qwen3_asr")
+
+if args.hass:
+    extras.append("hass")
 
 extras_str = ""
 if extras:

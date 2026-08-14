@@ -21,8 +21,8 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop  # noqa: E402
 from wyoming.info import Info  # noqa: E402
 
 from wyoming_faster_whisper.const import (  # noqa: E402
-    SttLibrary,
     StreamingSession,
+    SttLibrary,
     Transcriber,
 )
 from wyoming_faster_whisper.dispatch_handler import DispatchEventHandler  # noqa: E402
