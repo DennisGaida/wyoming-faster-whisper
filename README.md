@@ -79,14 +79,17 @@ Others ignore it.
 
 For `qwen3-asr` the prompt is not free: the model has to read it before it starts
 decoding, at roughly 2.8ms per token, so a 50-name list can double the time for a
-short command. A model directory containing `decoder_merged.int4.onnx` avoids
-this — the prompt sits ahead of the audio in the chat template, so its state is
-computed once and reused for every later utterance. It is selected automatically;
-directories with `decoder_init`/`decoder_step` keep working as before.
+short command.
+
+The default model avoids this. The prompt sits ahead of the audio in the chat
+template, so its state depends only on the prompt and is computed once, then
+reused for every later utterance. The layout is chosen from the files present, so
+older model directories with `decoder_init`/`decoder_step` keep working as before
+— pass `--model rhasspy/qwen3-asr-0.6b-onnx-int4` to use one.
 
 Measured on a Pi 5 (4 threads, 3.2s command, 50 names):
 
-| | split | merged |
+| | split | merged (default) |
 | --- | --- | --- |
 | latency | 3.42s | 2.20s |
 | peak RSS | 2.25 GB | 1.55 GB |
@@ -95,6 +98,10 @@ Measured on a Pi 5 (4 threads, 3.2s command, 50 names):
 The latency win is for short commands. Long-form audio gains little (~1.04x on a
 30s clip), because the cached prompt is a small share of that work — though the
 memory saving grows with length.
+
+Accuracy is unchanged: on LibriSpeech test-other (n=200) the two produce
+byte-identical transcripts with no prompt (5.35% WER for both), and 5.33% vs
+5.43% with a 50-name prompt.
 
 ## Docker Image
 
