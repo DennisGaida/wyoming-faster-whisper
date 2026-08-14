@@ -24,7 +24,7 @@ jobs:
 
       - name: Install
         run: |
-          script/setup --dev --transformers
+          script/setup --dev --transformers --qwen3-asr --hass
 
       - name: Run tests
         run: script/test
