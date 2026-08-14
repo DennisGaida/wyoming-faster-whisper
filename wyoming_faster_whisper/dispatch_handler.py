@@ -4,11 +4,12 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 import wave
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from wyoming.asr import Transcribe, Transcript
-from wyoming.audio import AudioChunk, AudioChunkConverter, AudioStop
+from wyoming.audio import AudioChunk, AudioChunkConverter, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Describe, Info
 from wyoming.server import AsyncEventHandler
@@ -16,6 +17,11 @@ from wyoming.server import AsyncEventHandler
 from .const import StreamingSession, Transcriber
 from .models import ModelLoader
 from .vad import clip_wav_to_speech
+
+if TYPE_CHECKING:
+    # Imported for typing only: the name cache pulls in aiohttp, which is an
+    # optional extra.
+    from .name_cache import HassNameCache
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +33,7 @@ class DispatchEventHandler(AsyncEventHandler):
         self,
         wyoming_info: Info,
         loader: ModelLoader,
+        names: Optional["HassNameCache"],
         *args,
         **kwargs,
     ) -> None:
@@ -35,6 +42,7 @@ class DispatchEventHandler(AsyncEventHandler):
         self.wyoming_info_event = wyoming_info.event()
 
         self._loader = loader
+        self._names = names
         self._transcriber: Optional[Transcriber] = None
         self._transcriber_future: Optional[asyncio.Future] = None
         self._language: Optional[str] = None
@@ -55,10 +63,25 @@ class DispatchEventHandler(AsyncEventHandler):
         self._session: Optional[StreamingSession] = None
         self._pending_audio: List[bytes] = []
 
+        # Whether this utterance already asked for a name refresh.
+        self._refreshed_names = False
+
     async def handle_event(self, event: Event) -> bool:
+        if AudioStart.is_type(event.type):
+            # Start refreshing Home Assistant's names now. The speaker is still
+            # talking, so the fetch has the length of their command to finish in
+            # and costs no latency at all.
+            self._refresh_names()
+            return True
+
         if AudioChunk.is_type(event.type):
             chunk = self._audio_converter.convert(AudioChunk.from_event(event))
             self._got_audio = True
+
+            # Safety net for clients that send audio without AudioStart. Calls
+            # after the first are cheap: a refresh already in flight is not
+            # started again.
+            self._refresh_names()
 
             if (self._transcriber is None) and (self._transcriber_future is None):
                 # Load the transcriber in the background.
@@ -89,6 +112,7 @@ class DispatchEventHandler(AsyncEventHandler):
 
         if AudioStop.is_type(event.type):
             _LOGGER.debug("Audio stopped")
+            start_time = time.monotonic()
 
             # No audio was received before AudioStop — return empty transcript.
             # This happens when HA sends AudioStop without any AudioChunk
@@ -141,13 +165,14 @@ class DispatchEventHandler(AsyncEventHandler):
                     wav_path,
                     self._language,
                     beam_size=self._loader.beam_size,
-                    initial_prompt=self._loader.initial_prompt,
+                    initial_prompt=await self._initial_prompt(),
                 )
 
+            end_time = time.monotonic()
             _LOGGER.info(text)
 
             await self.write_event(Transcript(text=text).event())
-            _LOGGER.debug("Completed request")
+            _LOGGER.debug("Completed request in %s second(s)", end_time - start_time)
 
             self._reset()
 
@@ -167,6 +192,32 @@ class DispatchEventHandler(AsyncEventHandler):
 
         return True
 
+    def _refresh_names(self) -> None:
+        """Kick off one background refresh of Home Assistant's names per utterance.
+
+        Called from both AudioStart and every AudioChunk, so it has to latch: a
+        finished fetch is immediately due again (--hass-refresh-seconds defaults
+        to 0), and without the latch every chunk would start another one.
+        """
+        if (self._names is None) or self._refreshed_names:
+            return
+
+        self._refreshed_names = True
+        self._names.schedule_refresh()
+
+    async def _initial_prompt(self, wait: bool = True) -> Optional[str]:
+        """The prompt to bias this utterance with.
+
+        Without --hass-token this is just the configured --initial-prompt; with
+        it, that prefix plus as many of Home Assistant's names as fit.
+        """
+        if self._names is None:
+            return self._loader.initial_prompt
+
+        prompt = await self._names.initial_prompt(self._transcriber, wait=wait)
+        _LOGGER.debug("Initial prompt: %s", prompt)
+        return prompt
+
     def _resolve_transcriber(self) -> None:
         """Promote the background-loaded transcriber if it's ready (no blocking)."""
         if self._transcriber is not None:
@@ -185,7 +236,9 @@ class DispatchEventHandler(AsyncEventHandler):
             self._session = self._transcriber.start_stream(
                 self._language,
                 beam_size=self._loader.beam_size,
-                initial_prompt=self._loader.initial_prompt,
+                # A streaming session needs its prompt before the audio ends, so
+                # there is nothing to wait for: use the names already on hand.
+                initial_prompt=await self._initial_prompt(wait=False),
             )
             if self._pending_audio:
                 # Replay audio buffered before the transcriber was ready.
@@ -222,3 +275,4 @@ class DispatchEventHandler(AsyncEventHandler):
         self._is_streaming = None
         self._session = None
         self._pending_audio = []
+        self._refreshed_names = False

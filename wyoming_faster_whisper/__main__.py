@@ -5,16 +5,27 @@ import logging
 import platform
 import re
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import faster_whisper
 from wyoming.info import AsrModel, AsrProgram, Attribution, Info
 from wyoming.server import AsyncServer, AsyncTcpServer
 
 from . import __version__
-from .const import AUTO_LANGUAGE, AUTO_MODEL, PARAKEET_LANGUAGES, SttLibrary
+from .const import (
+    AUTO_LANGUAGE,
+    AUTO_MODEL,
+    HASS_API_URL,
+    PARAKEET_LANGUAGES,
+    SttLibrary,
+)
 from .dispatch_handler import DispatchEventHandler
 from .models import ModelLoader
+from .vocabulary import DEFAULT_PROMPT_MAX_TOKENS
+
+if TYPE_CHECKING:
+    # Imported for typing only: aiohttp is an optional extra.
+    from .name_cache import HassNameCache
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +150,38 @@ async def main() -> None:
         action="store_true",
         help="Don't check HuggingFace hub for updates every time",
     )
+    # Home Assistant name biasing (extra: hass)
+    parser.add_argument(
+        "--hass-token",
+        help="Long-lived access token for Home Assistant. Enables biasing toward "
+        "the names of exposed entities, areas, and floors (extra: hass)",
+    )
+    parser.add_argument(
+        "--hass-api",
+        default=HASS_API_URL,
+        help=f"URL of the Home Assistant API (default: {HASS_API_URL})",
+    )
+    parser.add_argument(
+        "--hass-refresh-seconds",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between name refreshes (default: 0, refresh on "
+        "every utterance)",
+    )
+    parser.add_argument(
+        "--hass-prompt-max-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_MAX_TOKENS,
+        help="Token budget for names in the prompt "
+        f"(default: {DEFAULT_PROMPT_MAX_TOKENS}, max useful: 223 for Whisper)",
+    )
+    parser.add_argument(
+        "--hass-prompt-timeout",
+        type=float,
+        default=1.0,
+        help="Seconds to wait for an unfinished name refresh before transcribing "
+        "with the previous names (default: 1.0)",
+    )
     #
     parser.add_argument("--debug", action="store_true", help="Log DEBUG messages")
     parser.add_argument(
@@ -252,6 +295,8 @@ async def main() -> None:
     _LOGGER.debug("Pre-loading transcriber")
     await loader.load_transcriber()
 
+    names = await _load_names(args)
+
     server = AsyncServer.from_uri(args.uri)
 
     if args.zeroconf:
@@ -273,8 +318,48 @@ async def main() -> None:
             DispatchEventHandler,
             wyoming_info,
             loader,
+            names,
         )
     )
+
+
+# -----------------------------------------------------------------------------
+
+
+async def _load_names(args: argparse.Namespace) -> Optional["HassNameCache"]:
+    """Set up biasing toward Home Assistant's names, if a token was given."""
+    if not args.hass_token:
+        return None
+
+    try:
+        from .hass_api import HomeAssistant
+        from .name_cache import HassNameCache
+    except ImportError as exc:
+        raise ImportError(
+            "--hass-token requires the 'hass' extra: "
+            "pip install 'wyoming-faster-whisper[hass]'"
+        ) from exc
+
+    names = HassNameCache(
+        HomeAssistant(args.hass_token, api_url=args.hass_api),
+        prefix=args.initial_prompt,
+        max_tokens=args.hass_prompt_max_tokens,
+        refresh_seconds=args.hass_refresh_seconds,
+        wait_timeout=args.hass_prompt_timeout,
+    )
+
+    # Fetch once now so the first utterance is biased too. Best effort: Home
+    # Assistant may still be starting up, and that must not stop this server
+    # from serving. Every utterance retries.
+    if await names.refresh():
+        _LOGGER.info("Biasing toward names from %s", args.hass_api)
+    else:
+        _LOGGER.warning(
+            "No names loaded from %s yet; will retry on each utterance",
+            args.hass_api,
+        )
+
+    return names
 
 
 # -----------------------------------------------------------------------------

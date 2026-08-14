@@ -336,7 +336,10 @@ def guess_model(
         return "gigaam-v2-rnnt"
 
     if stt_library == SttLibrary.QWEN3_ASR:
-        return "rhasspy/qwen3-asr-0.6b-onnx-int4"
+        # Merged decoder: same weights as qwen3-asr-0.6b-onnx-int4, but the
+        # biasing prompt's KV cache is reusable and the package is 785 MB rather
+        # than 1.4 GB. The split repo still works if given explicitly.
+        return "rhasspy/qwen3-asr-0.6b-onnx-int4-merged"
 
     if stt_library == SttLibrary.FUNASR:
         return "FunAudioLLM/SenseVoiceSmall"

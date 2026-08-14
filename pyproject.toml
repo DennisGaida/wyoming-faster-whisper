@@ -85,6 +85,9 @@ qwen3_asr = [
     "onnxruntime>=1.18.1",
     "tokenizers>=0.20",
 ]
+hass = [
+    "aiohttp>=3.8,<4",
+]
 zeroconf = [
     "wyoming[zeroconf]",
 ]
