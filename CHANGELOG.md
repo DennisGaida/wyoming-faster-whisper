@@ -15,6 +15,7 @@
 - Add support for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) via `--stt-library qwen3-asr` (extra: `qwen3_asr`), defaulting to [`rhasspy/qwen3-asr-0.6b-onnx-int4-merged`](https://huggingface.co/rhasspy/qwen3-asr-0.6b-onnx-int4-merged)
 - `--initial-prompt` now also biases the Qwen3-ASR backend: it is passed as the model's context prompt, which corrects entity names (e.g. `Vocabulary: Ecobee.` turns "incubator" into "Ecobee")
 - Qwen3-ASR is opt-in only (`auto` never selects it): the model is 785 MB and needs ~1.6 GB of RAM, and it is slower than the per-language defaults
+- `--vad-clip` now takes optional speech-to-text libraries, so clipping can be enabled only where it pays off: `--vad-clip qwen3-asr` clips for that backend alone, while a bare `--vad-clip` still applies to every library. Qwen3-ASR costs ~235 ms per second of audio on a Pi 5 (encoder, prefill, *and* per-token decode all scale with input length), so trimming silence off a typical command saves ~20%; faster-whisper pads to 30s internally and gains nothing
 
 ## 3.5.0
 

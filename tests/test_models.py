@@ -7,7 +7,7 @@ as arguments, so the real STT backends need not be installed.
 import pytest
 
 from wyoming_faster_whisper.const import SttLibrary
-from wyoming_faster_whisper.models import guess_stt_library
+from wyoming_faster_whisper.models import guess_stt_library, vad_clip_enabled
 
 _ALL_AVAILABLE = dict(
     has_transformers=True,
@@ -52,8 +52,7 @@ def test_auto_selects_per_language_backend(language, expected) -> None:
 def test_auto_funasr_languages_fall_back_when_funasr_missing() -> None:
     # zh would route to FunASR, but it isn't installed -> faster-whisper.
     assert (
-        _guess(SttLibrary.AUTO, "zh-CN", has_funasr=False)
-        == SttLibrary.FASTER_WHISPER
+        _guess(SttLibrary.AUTO, "zh-CN", has_funasr=False) == SttLibrary.FASTER_WHISPER
     )
 
 
@@ -74,8 +73,7 @@ def test_explicit_funasr_kept_when_available() -> None:
 
 def test_explicit_funasr_falls_back_when_missing() -> None:
     assert (
-        _guess(SttLibrary.FUNASR, "zh", has_funasr=False)
-        == SttLibrary.FASTER_WHISPER
+        _guess(SttLibrary.FUNASR, "zh", has_funasr=False) == SttLibrary.FASTER_WHISPER
     )
 
 
@@ -101,4 +99,52 @@ def test_explicit_faster_whisper_is_passthrough() -> None:
     assert (
         _guess(SttLibrary.FASTER_WHISPER, "en", has_sherpa=False)
         == SttLibrary.FASTER_WHISPER
+    )
+
+
+# --- --vad-clip library selection -----------------------------------------
+
+
+def test_vad_clip_off_when_flag_absent() -> None:
+    for library in SttLibrary:
+        assert not vad_clip_enabled(library, vad_clip=False)
+
+
+def test_bare_vad_clip_applies_to_every_library() -> None:
+    # `--vad-clip` with no values -> vad_clip_libraries is None.
+    for library in SttLibrary:
+        assert vad_clip_enabled(library, vad_clip=True, vad_clip_libraries=None)
+
+
+def test_named_library_is_clipped() -> None:
+    assert vad_clip_enabled(
+        SttLibrary.QWEN3_ASR, vad_clip=True, vad_clip_libraries={SttLibrary.QWEN3_ASR}
+    )
+
+
+def test_unnamed_libraries_are_not_clipped() -> None:
+    # `--vad-clip qwen3-asr` must leave faster-whisper alone, where clipping
+    # buys nothing (audio is padded to 30s internally regardless).
+    assert not vad_clip_enabled(
+        SttLibrary.FASTER_WHISPER,
+        vad_clip=True,
+        vad_clip_libraries={SttLibrary.QWEN3_ASR},
+    )
+
+
+def test_several_libraries_can_be_named() -> None:
+    named = {SttLibrary.QWEN3_ASR, SttLibrary.SHERPA}
+    assert vad_clip_enabled(SttLibrary.SHERPA, vad_clip=True, vad_clip_libraries=named)
+    assert vad_clip_enabled(
+        SttLibrary.QWEN3_ASR, vad_clip=True, vad_clip_libraries=named
+    )
+    assert not vad_clip_enabled(
+        SttLibrary.FUNASR, vad_clip=True, vad_clip_libraries=named
+    )
+
+
+def test_named_libraries_are_ignored_when_flag_is_off() -> None:
+    # Defensive: a stale library set must not enable clipping on its own.
+    assert not vad_clip_enabled(
+        SttLibrary.QWEN3_ASR, vad_clip=False, vad_clip_libraries={SttLibrary.QWEN3_ASR}
     )

@@ -146,11 +146,13 @@ class DispatchEventHandler(AsyncEventHandler):
                 self._wav_file = None
 
                 # Optionally clip leading/trailing silence before transcription.
-                # This is backend-agnostic (operates on the WAV), so it applies
-                # to every batch transcriber, not just faster-whisper. Streaming
+                # This operates on the WAV, so any batch transcriber can use it;
+                # --vad-clip decides which libraries actually do. Streaming
                 # transcribers never reach this path.
                 wav_path = self._wav_path
-                if self._loader.vad_clip and await asyncio.to_thread(
+                if self._loader.should_vad_clip(
+                    self._language
+                ) and await asyncio.to_thread(
                     clip_wav_to_speech,
                     self._wav_path,
                     self._clipped_wav_path,

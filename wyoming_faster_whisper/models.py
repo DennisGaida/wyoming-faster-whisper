@@ -6,7 +6,7 @@ import logging
 import platform
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
 from .const import SttLibrary, Transcriber, sense_voice_language
 from .faster_whisper_handler import FasterWhisperTranscriber
@@ -52,6 +52,7 @@ class ModelLoader:
         vad_clip: bool = False,
         vad_clip_threshold: float = 0.5,
         vad_clip_pad_ms: int = 400,
+        vad_clip_libraries: Optional[Set[SttLibrary]] = None,
     ) -> None:
         self.preferred_stt_library = preferred_stt_library
         self.preferred_language = preferred_language
@@ -72,15 +73,26 @@ class ModelLoader:
         self.vad_clip = vad_clip
         self.vad_clip_threshold = vad_clip_threshold
         self.vad_clip_pad_ms = vad_clip_pad_ms
+        # None means every library when vad_clip is set; otherwise only these.
+        self.vad_clip_libraries = vad_clip_libraries
 
         self._transcriber: Dict[TRANSCRIBER_KEY, Transcriber] = {}
         self._transcriber_lock: Dict[TRANSCRIBER_KEY, asyncio.Lock] = defaultdict(
             asyncio.Lock
         )
+        self._stt_library: Dict[Optional[str], SttLibrary] = {}
 
-    async def load_transcriber(self, language: Optional[str] = None) -> Transcriber:
-        """Load or get transcriber from cache for a language."""
+    def resolve_stt_library(self, language: Optional[str] = None) -> SttLibrary:
+        """Resolve which speech-to-text library will be used for a language.
+
+        Cached per language: backend availability cannot change while running, and
+        callers (transcriber loading, the --vad-clip decision) ask repeatedly.
+        """
         language = language or self.preferred_language
+
+        cached = self._stt_library.get(language)
+        if cached is not None:
+            return cached
 
         # Detect which backends are installed *without* importing them. Importing
         # a backend loads its native libraries (sherpa-onnx, torch, onnxruntime,
@@ -119,6 +131,21 @@ class ModelLoader:
             has_funasr=has_funasr,
             has_qwen3_asr=has_qwen3_asr,
         )
+        self._stt_library[language] = stt_library
+        return stt_library
+
+    def should_vad_clip(self, language: Optional[str] = None) -> bool:
+        """Report whether leading/trailing silence should be clipped."""
+        return vad_clip_enabled(
+            self.resolve_stt_library(language),
+            self.vad_clip,
+            self.vad_clip_libraries,
+        )
+
+    async def load_transcriber(self, language: Optional[str] = None) -> Transcriber:
+        """Load or get transcriber from cache for a language."""
+        language = language or self.preferred_language
+        stt_library = self.resolve_stt_library(language)
 
         # Streaming is only supported by the sherpa backend.
         streaming = self.sherpa_streaming and (stt_library == SttLibrary.SHERPA)
@@ -231,6 +258,28 @@ class ModelLoader:
         _LOGGER.debug("Transcribed audio: %s", text)
 
         return text
+
+
+def vad_clip_enabled(
+    stt_library: SttLibrary,
+    vad_clip: bool,
+    vad_clip_libraries: Optional[Set[SttLibrary]] = None,
+) -> bool:
+    """Report whether --vad-clip applies to a resolved speech-to-text library.
+
+    `--vad-clip` with no values enables clipping for every library
+    (vad_clip_libraries is None); naming libraries restricts it to those, which is
+    useful because the benefit is backend-specific. Clipping is a clear win for
+    length-proportional backends (qwen3-asr, sherpa, funasr) and a wash for
+    faster-whisper, which pads audio to 30s internally regardless.
+    """
+    if not vad_clip:
+        return False
+
+    if vad_clip_libraries is None:
+        return True
+
+    return stt_library in vad_clip_libraries
 
 
 def guess_stt_library(
