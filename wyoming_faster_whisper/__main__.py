@@ -118,8 +118,12 @@ async def main() -> None:
     )
     parser.add_argument(
         "--vad-clip",
-        action="store_true",
-        help="Use pysilero-vad to clip leading/trailing silence before transcription (default: disabled; use --vad-clip to enable)",
+        nargs="*",
+        metavar="STT_LIBRARY",
+        choices=[lib.value for lib in SttLibrary if lib != SttLibrary.AUTO],
+        help="Use pysilero-vad to clip leading/trailing silence before "
+        "transcription (default: disabled). Pass --vad-clip for every library, or "
+        "name the libraries it applies to, e.g. --vad-clip qwen3-asr",
     )
     parser.add_argument(
         "--vad-clip-threshold",
@@ -206,6 +210,13 @@ async def main() -> None:
 
     args.stt_library = SttLibrary(args.stt_library)
 
+    # argparse gives None when --vad-clip is absent, [] when it is passed with no
+    # values (every library), and the named libraries otherwise.
+    vad_clip = args.vad_clip is not None
+    vad_clip_libraries = (
+        {SttLibrary(value) for value in args.vad_clip} if args.vad_clip else None
+    )
+
     machine = platform.machine().lower()
     is_arm = ("arm" in machine) or ("aarch" in machine)
 
@@ -286,9 +297,10 @@ async def main() -> None:
         vad_parameters=vad_parameters,
         whisper_task=args.whisper_task,
         sherpa_streaming=args.sherpa_streaming,
-        vad_clip=args.vad_clip,
+        vad_clip=vad_clip,
         vad_clip_threshold=args.vad_clip_threshold,
         vad_clip_pad_ms=args.vad_clip_pad_ms,
+        vad_clip_libraries=vad_clip_libraries,
     )
 
     # Load model

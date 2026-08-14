@@ -9,7 +9,7 @@ refresh, AudioStop waits for it, and the resulting prompt reaches
 import asyncio
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import pytest
 
@@ -20,9 +20,14 @@ from wyoming.asr import Transcribe, Transcript  # noqa: E402
 from wyoming.audio import AudioChunk, AudioStart, AudioStop  # noqa: E402
 from wyoming.info import Info  # noqa: E402
 
-from wyoming_faster_whisper.const import StreamingSession, Transcriber  # noqa: E402
+from wyoming_faster_whisper.const import (  # noqa: E402
+    SttLibrary,
+    StreamingSession,
+    Transcriber,
+)
 from wyoming_faster_whisper.dispatch_handler import DispatchEventHandler  # noqa: E402
 from wyoming_faster_whisper.hass_api import HomeAssistantError  # noqa: E402
+from wyoming_faster_whisper.models import vad_clip_enabled  # noqa: E402
 from wyoming_faster_whisper.name_cache import HassNameCache  # noqa: E402
 from wyoming_faster_whisper.vocabulary import RecognitionContext  # noqa: E402
 
@@ -68,6 +73,7 @@ class FakeTranscriber(Transcriber):
                 "language": language,
                 "beam_size": beam_size,
                 "initial_prompt": initial_prompt,
+                "wav_path": str(wav_path),
             }
         )
         return "fake transcript"
@@ -113,9 +119,17 @@ class FakeLoader:
         self.vad_clip = False
         self.vad_clip_threshold = 0.5
         self.vad_clip_pad_ms = 400
+        self.vad_clip_libraries: Optional[Set[SttLibrary]] = None
+        self.stt_library = SttLibrary.QWEN3_ASR
 
     async def load_transcriber(self, language: Optional[str] = None) -> Transcriber:
         return self.transcriber
+
+    def should_vad_clip(self, language: Optional[str] = None) -> bool:
+        # Defer to the real predicate so the fake cannot drift from production.
+        return vad_clip_enabled(
+            self.stt_library, self.vad_clip, self.vad_clip_libraries
+        )
 
 
 class FakeHass:
@@ -406,3 +420,42 @@ async def test_a_streaming_session_does_not_wait_for_a_slow_fetch():
 
     assert transcriber.sessions[0].initial_prompt == "Vocabulary:"
     assert elapsed < 1.0, f"streaming start blocked for {elapsed:.1f}s"
+
+
+# --- --vad-clip library selection -----------------------------------------
+
+
+async def test_clipping_is_skipped_for_a_library_that_was_not_named():
+    """`--vad-clip qwen3-asr` must not clip for other backends."""
+    transcriber = FakeTranscriber()
+    handler = _handler(transcriber)
+    handler._loader.vad_clip = True
+    handler._loader.vad_clip_libraries = {SttLibrary.QWEN3_ASR}
+    handler._loader.stt_library = SttLibrary.FASTER_WHISPER
+
+    await _utterance(handler)
+
+    # The untouched recording is transcribed, not the clipped copy.
+    assert transcriber.calls[-1]["wav_path"] == handler._wav_path
+
+
+async def test_clipping_is_attempted_for_a_named_library():
+    transcriber = FakeTranscriber()
+    handler = _handler(transcriber)
+    handler._loader.vad_clip = True
+    handler._loader.vad_clip_libraries = {SttLibrary.QWEN3_ASR}
+    handler._loader.stt_library = SttLibrary.QWEN3_ASR
+
+    clipped: List[str] = []
+
+    def fake_clip(src, dst, threshold, pad_ms) -> bool:
+        clipped.append(str(src))
+        return False  # silence only: fall back to the original WAV
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "wyoming_faster_whisper.dispatch_handler.clip_wav_to_speech", fake_clip
+        )
+        await _utterance(handler)
+
+    assert clipped == [handler._wav_path]
